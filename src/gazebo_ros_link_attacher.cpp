@@ -40,6 +40,9 @@ namespace gazebo
     this->detach_service_ = this->nh_.advertiseService("detach", &GazeboRosLinkAttacher::detach_callback, this);
     ROS_INFO_STREAM("Detach service at: " << this->nh_.resolveName("detach"));
     ROS_INFO("Link attacher node initialized.");
+
+    this->updateConnection = event::Events::ConnectWorldUpdateBegin(
+          std::bind(&GazeboRosLinkAttacher::onUpdate, this));
   }
 
   bool GazeboRosLinkAttacher::attach(std::string model1, std::string link1,
@@ -177,17 +180,39 @@ namespace gazebo
   bool GazeboRosLinkAttacher::attach_callback(gazebo_ros_link_attacher::Attach::Request &req,
                                               gazebo_ros_link_attacher::Attach::Response &res)
   {
+    std::unique_lock<std::mutex> lock(cb_mutex);
+
     ROS_INFO_STREAM("Received request to attach model: '" << req.model_name_1
                     << "' using link: '" << req.link_name_1 << "' with model: '"
                     << req.model_name_2 << "' using link: '" <<  req.link_name_2 << "'");
-    if (! this->attach(req.model_name_1, req.link_name_1,
-                       req.model_name_2, req.link_name_2)){
-      ROS_ERROR_STREAM("Could not make the attach.");
-      res.ok = false;
+
+    auto op = std::make_shared<GazeboRosLinkAttacher_op>();
+    op->complete=false;
+    op->res=false;
+    auto op_ptr = op.get();
+    op->func=[this,op_ptr,req]()
+    {
+      op_ptr->res = this->attach(req.model_name_1, req.link_name_1,
+                       req.model_name_2, req.link_name_2);
+    };
+
+    ops.push(op);
+
+    if(op->cond_var.wait_for(lock,std::chrono::milliseconds(5000)) == std::cv_status::timeout)
+    {
+      ROS_ERROR_STREAM("Could not make the attach due to timeout.");
+      res.ok = false;      
     }
-    else{
-      ROS_INFO_STREAM("Attach was succesful");
-      res.ok = true;
+    else
+    {    
+      if (! op->res){
+        ROS_ERROR_STREAM("Could not make the attach.");
+        res.ok = false;
+      }
+      else{
+        ROS_INFO_STREAM("Attach was succesful");
+        res.ok = true;
+      }
     }
     return true;
 
@@ -195,19 +220,56 @@ namespace gazebo
 
   bool GazeboRosLinkAttacher::detach_callback(gazebo_ros_link_attacher::Attach::Request &req,
                                               gazebo_ros_link_attacher::Attach::Response &res){
+      
+      std::unique_lock<std::mutex> lock(cb_mutex);
+
       ROS_INFO_STREAM("Received request to detach model: '" << req.model_name_1
                       << "' using link: '" << req.link_name_1 << "' with model: '"
                       << req.model_name_2 << "' using link: '" <<  req.link_name_2 << "'");
-      if (! this->detach(req.model_name_1, req.link_name_1,
-                         req.model_name_2, req.link_name_2)){
-        ROS_ERROR_STREAM("Could not make the detach.");
-        res.ok = false;
+
+      auto op = std::make_shared<GazeboRosLinkAttacher_op>();
+      op->complete=false;
+      op->res=false;
+      auto op_ptr = op.get();
+      op->func=[this,op_ptr,req]()
+      {
+        op_ptr->res = this->detach(req.model_name_1, req.link_name_1,
+                        req.model_name_2, req.link_name_2);
+      };
+
+      ops.push(op);
+
+      if(op->cond_var.wait_for(lock,std::chrono::milliseconds(5000)) == std::cv_status::timeout)
+      {
+        ROS_ERROR_STREAM("Could not make the attach due to timeout.");
+        res.ok = false;      
       }
-      else{
-        ROS_INFO_STREAM("Detach was succesful");
-        res.ok = true;
+      else
+      {
+        if (! op->res){
+          ROS_ERROR_STREAM("Could not make the detach.");
+          res.ok = false;
+        }
+        else{
+          ROS_INFO_STREAM("Detach was succesful");
+          res.ok = true;
+        }
       }
       return true;
+  }
+
+  void GazeboRosLinkAttacher::onUpdate()
+  {
+    std::unique_lock<std::mutex> lock(cb_mutex);
+
+    while (!ops.empty())
+    {
+      auto f = ops.front();
+      ops.pop();
+      f->func();
+      f->complete = true;      
+      f->cond_var.notify_all();      
+    }
   }
 
 }
